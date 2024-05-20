@@ -1,0 +1,7 @@
+
+using functions where necessary:
+- read data from text file
+- organize data to suitable form
+- split data to train and val
+
+
