@@ -135,3 +135,6 @@ dmypy.json
 
 # unnecessary jupyter notebooks
 *.ipynb
+
+# heavy files
+/artifacts/checkpoint

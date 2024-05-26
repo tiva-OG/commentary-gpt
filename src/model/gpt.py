@@ -1,62 +1,61 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from dataclasses import dataclass
 
-from src.model.components import Block
+# set device type
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-@dataclass
-class GPTConfig:
-    # hyperparameters
-    batch_size: int = 4
-    block_size: int = 8
-    vocab_size: int = 102
-    n_embed: int = 16
-    n_head: int = 2
-    n_blocks: int = 4
-    dim_qk: int = 8
-    dim_v: int = 8
-
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(1337)
 
 
 class CommentaryGPT(nn.Module):
+    """
+    B -> Batch (batch_size)
+    T -> Time-step (block_size)
+    C -> Channels (n_embed)
+    V -> Vocab-size (vocab_size)
+    """
 
     def __init__(self, config):
         super().__init__()
-        self.config = config
+        global block_size
+        global dropout
 
-        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embed)
-        self.position_embedding_table = nn.Embedding(config.vocab_size, config.n_embed)
-        self.blocks = nn.Sequential(
-            *[Block(config.n_head, config.n_embed, config.dim_qk, config.dim_v) for _ in range(config.n_blocks)])
-        self.layer_norm = nn.LayerNorm(config.n_embed)
-        self.linear_head = nn.Linear(config.n_embed, config.vocab_size)
+        block_size = config.block_size
+        dropout = config.dropout
+        n_embed = config.n_embed
+        n_head = config.n_head
+        n_layer = config.n_layer
+        vocab_size = config.vocab_size
+
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head) for _ in range(n_layer)])
+        self.l_norm = nn.LayerNorm(n_embed)
+        self.ln_head = nn.Linear(n_embed, vocab_size)
+
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, inputs, targets=None):
-        # B -> batch_size
-        # T -> block_size
-        # C -> n_embed
-        # V -> vocab_size
-
+        # expected i/p size -- (B, T) [both inputs & targets]
+        # expected o/p size -- (B, T, V)
         B, T = inputs.shape
-        token_embeddings = self.token_embedding_table(inputs)  # (B, T, C)
-        position_embeddings = self.position_embedding_table(torch.arange(T, device=self.config.device))  # (T, C)
 
+        token_embeddings = self.token_embedding_table(inputs)  # (B, T, C)
+        position_embeddings = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
         x = token_embeddings + position_embeddings  # (B, T, C)
-        x = self.blocks(x)
-        x = self.layer_norm(x)
-        logits = self.linear_head(x)  # (B, T, V)
+        x = self.blocks(x)  # (B, T, C)
+        x = self.l_norm(x)  # (B, T, C)
+        logits = self.ln_head(x)  # (B, T, V)
 
         if targets is None:
             loss = None
@@ -68,19 +67,128 @@ class CommentaryGPT(nn.Module):
 
         return logits, loss
 
+    @torch.no_grad()
     def generate(self, inputs, max_num_tokens):
         for _ in range(max_num_tokens):
             # crop inputs to the last block_size tokens
-            cropped_inputs = inputs[:, -self.config.block_size:]
+            cropped_inp = inputs[:, -block_size:]
             # get predictions
-            logits, loss = self(cropped_inputs)
+            logits, loss = self(cropped_inp)
             # focus should be only on the last time-step
             logits = logits[:, -1, :]  # (B, C)
             # compute probabilities
-            probs = F.softmax(logits, dim=-1)  # (B, C)
+            probs = F.softmax(logits, dim=-1)  # (B, V)
             # sample from distribution
             id_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
             # append sampled id to running sequence
             inputs = torch.cat((inputs, id_next), dim=1)
 
         return inputs
+
+
+class SelfAttention(nn.Module):
+    """
+    single self-attention head
+    B -> Batch (batch_size)
+    T -> Time-step (block_size)
+    C -> Channels (n_embed)
+    H -> Head (head_size)
+    """
+
+    def __init__(self, n_embed, head_size):
+        super().__init__()
+
+        self.w_query = nn.Linear(n_embed, head_size, bias=False)
+        self.w_key = nn.Linear(n_embed, head_size, bias=False)
+        self.w_value = nn.Linear(n_embed, head_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, inputs):
+        # expected i/p size -- (B, T, C)
+        # expected o/p size -- (B, T, H)
+        B, T, C = inputs.shape
+
+        queries = self.w_query(inputs)
+        keys = self.w_key(inputs)
+        values = self.w_value(inputs)
+
+        # compute attention scores
+        attn_scores = queries @ keys.transpose(-2, -1)  # (B, T, H) @ (B, H, T) --> (B, T, T)
+        attn_scores = attn_scores / (keys.shape[-1] ** 0.5)
+        attn_weights = attn_scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # perform weighted aggregation of the values
+        context_vectors = attn_weights @ values  # (B, T, T) @ (B, T, H) --> (B, T, H)
+
+        return context_vectors
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    multiple self-attention heads in parallel
+    B -> Batch (batch_size)
+    T -> Time-step (block_size)
+    C -> Channels (n_embed)
+    H -> Head (head_size)
+    """
+
+    def __init__(self, n_head, n_embed, head_size):
+        super().__init__()
+
+        self.attn_heads = nn.ModuleList([SelfAttention(n_embed, head_size) for _ in range(n_head)])
+        self.ln_proj = nn.Linear(head_size * n_head, n_embed)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, inputs):
+        # expected i/p size -- (B, T, C)
+        # expected o/p size -- (B, T, C)
+
+        x = torch.cat([attn_head(inputs) for attn_head in self.attn_heads], dim=-1)
+        x = self.ln_proj(x)
+        x = self.dropout(x)
+
+        return x
+
+
+class FeedForward(nn.Module):
+    """
+    simple linear layer accompanied by non-linearity
+    """
+
+    def __init__(self, n_embed):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            nn.Linear(n_embed * 4, n_embed),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, inputs):
+        return self.net(inputs)
+
+
+class Block(nn.Module):
+    """
+    transformer block: communication followed by computation
+    """
+
+    def __init__(self, n_embed, n_head):
+        super().__init__()
+        head_size = n_embed // n_head
+
+        self.attn_heads = MultiHeadAttention(n_head, n_embed, head_size)
+        self.feed_fwd = FeedForward(n_embed)
+        self.l_norm_1 = nn.LayerNorm(n_embed)
+        self.l_norm_2 = nn.LayerNorm(n_embed)
+
+    def forward(self, inputs):
+        x = inputs + self.attn_heads(self.l_norm_1(inputs))
+        x = x + self.feed_fwd(self.l_norm_2(x))
+
+        return x

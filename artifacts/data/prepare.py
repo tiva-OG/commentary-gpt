@@ -11,7 +11,7 @@ import requests
 import numpy as np
 
 # download the epl match-commentary dataset
-__file__ = "C:/Users/salva/Desktop/projects/eplGPT/data/match_commentary.txt"
+__file__ = "/artifacts/data/match_commentary.txt"
 input_file_path = os.path.join(os.path.dirname(__file__), "match_commentary.txt")
 if not os.path.exists(input_file_path):
     data_url = ""
